@@ -296,10 +296,6 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    # 256 threads in the blocks
-    # Constant used for the loops to avoid repeat computations
-    n_threads = 256
-    
     tid = cuda.threadIdx.x
 
     # Each thread computes an 8 x 8 tile this time, and the full block computes 128 x 128
@@ -316,30 +312,31 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     B_shared = cuda.shared.array((BK5, BN5), float32)
 
     # 8 x 8 local sums for this thread
-    thread_tile_size = TM5 * TN5
-    
-    # 64 is the thread tile size (TM5 * TN5)
-    # I had to put it in as 64 because it would crash otherwise
-    # (Maybe because it runs at compile time before python runs)
-    dot_sums = cuda.local.array(64, float32)
+    dot_sums = cuda.local.array((TM5, TN5), float32)
 
     # Small local arrays for temporary values during one k_offset later on
     reg_a = cuda.local.array(TM5, float32)
     reg_b = cuda.local.array(TN5, float32)
 
     # Initialize all 64 dot sums
-    for i in range(TM5 * TN5):
-        dot_sums[i] = float32(0.0)
+    for i in range(TM5):
+        for j in range(TN5):
+            dot_sums[i, j] = float32(0.0)
 
+    # Precompute columns outside of loop
+    # Moved this from being computed inside the tile loop to outside to improve performance
+    a_local_col = tid % BK5
+    b_local_col = tid % BN5
+    
     # Move across K in steps of 8 (BK5)
     for tile_offset in range(0, K, BK5):
         
         # Load A into shared memory, A is 128 x 8
         # There are 256 threads, so each thread loads 4 values
-        for load_idx in range(tid, BM5 * BK5, 256):
-            # Construct 2D array of A tiled
+        for load_idx in range(tid, BM5 * BK5, cuda.blockDim.x):
+            # Reconstruct row from load_idx, but column is precomputed this time
             a_local_row = load_idx // BK5
-            a_local_col = load_idx % BK5
+            # a_local_col = load_idx % BK5 # Computed outside of the loop now
 
             a_global_row = cuda.blockIdx.y * BM5 + a_local_row
             a_global_col = tile_offset + a_local_col
@@ -352,9 +349,9 @@ def sgemm_2d_tile(A, B, C, M, N, K):
 
         # Load B into shared memory, B is 8 x 128
         # Each thread loads 4 values again like in A
-        for load_idx in range(tid, BK5 * BN5, 256):
+        for load_idx in range(tid, BK5 * BN5, cuda.blockDim.x):
             b_local_row = load_idx // BN5
-            b_local_col = load_idx % BN5
+            # b_local_col = load_idx % BN5 # Same as in A, computed outside
 
             b_global_row = tile_offset + b_local_row
             b_global_col = cuda.blockIdx.x * BN5 + b_local_col
@@ -384,7 +381,7 @@ def sgemm_2d_tile(A, B, C, M, N, K):
             # Actual matrix multiplication using outer product update
             for i in range(TM5):
                 for j in range(TN5):
-                    dot_sums[i * TN5 + j] += reg_a[i] * reg_b[j]                    
+                    dot_sums[i, j] += reg_a[i] * reg_b[j]                    
 
         cuda.syncthreads()
 
@@ -395,8 +392,7 @@ def sgemm_2d_tile(A, B, C, M, N, K):
             col = col_start + j
 
             if row < M and col < N:
-                C[row, col] = dot_sums[i * TN5 + j]
-
+                C[row, col] = dot_sums[i, j]
                 
 # ── Launch wrappers (provided — do not edit) ────────────────────────
 
