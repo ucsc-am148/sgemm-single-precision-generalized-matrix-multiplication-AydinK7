@@ -312,8 +312,10 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     B_shared = cuda.shared.array((BK5, BN5), float32)
 
     # 8 x 8 local sums for this thread
+    thread_tile_size = TM5 * TN5
+    
     dot_sums = cuda.local.array((TM5, TN5), float32)
-
+    
     # Small local arrays for temporary values during one k_offset later on
     reg_a = cuda.local.array(TM5, float32)
     reg_b = cuda.local.array(TN5, float32)
@@ -323,24 +325,43 @@ def sgemm_2d_tile(A, B, C, M, N, K):
         for j in range(TN5):
             dot_sums[i, j] = float32(0.0)
 
-    # Precompute columns outside of loop
-    # Moved this from being computed inside the tile loop to outside to improve performance
-    a_local_col = tid % BK5
-    b_local_col = tid % BN5
+            
+    # Precompute base row and column offsets once per thread so we prevent
+    # the GPU from repeating the same computations inside the main loop
+    a_row_start = thread_row_group * TM5
+    b_col_start = thread_col_group * TN5
     
+    block_row_offset = cuda.blockIdx.y * BM5
+    block_col_offset = cuda.blockIdx.x * BN5
+
+    a_local_col = tid % BK5
+    a_local_row_base = tid // BK5
+
+    b_local_col = tid % BN5
+    b_local_row_base = tid // BN5
+    b_global_col_load = block_col_offset + b_local_col
+
+    # Define constants to use that will run at compile time inside the loop
+    num_threads = (BM5 * BN5) // (TM5 * TN5)
+
+    A_loads = (BM5 * BK5) // num_threads # Define how many loads per thread for A and B
+    B_loads = (BK5 * BN5) // num_threads 
+
+    A_row_stride = num_threads // BK5
+    B_row_stride = num_threads // BN5
+    
+
     # Move across K in steps of 8 (BK5)
     for tile_offset in range(0, K, BK5):
         
         # Load A into shared memory, A is 128 x 8
         # There are 256 threads, so each thread loads 4 values
-        for load_idx in range(tid, BM5 * BK5, cuda.blockDim.x):
-            # Reconstruct row from load_idx, but column is precomputed this time
-            a_local_row = load_idx // BK5
-            # a_local_col = load_idx % BK5 # Computed outside of the loop now
-
-            a_global_row = cuda.blockIdx.y * BM5 + a_local_row
+        for load_index in range(A_loads):
+            a_local_row = a_local_row_base + load_index * A_row_stride
+            
+            a_global_row = block_row_offset + a_local_row
             a_global_col = tile_offset + a_local_col
-
+            
             # Check if A is in bounds, if it is, put it in shared memory
             if a_global_row < M and a_global_col < K:
                 A_shared[a_local_row, a_local_col] = A[a_global_row, a_global_col]
@@ -349,19 +370,17 @@ def sgemm_2d_tile(A, B, C, M, N, K):
 
         # Load B into shared memory, B is 8 x 128
         # Each thread loads 4 values again like in A
-        for load_idx in range(tid, BK5 * BN5, cuda.blockDim.x):
-            b_local_row = load_idx // BN5
-            # b_local_col = load_idx % BN5 # Same as in A, computed outside
-
+        for load_index in range(B_loads):
+            b_local_row = b_local_row_base + load_index * B_row_stride
+            
             b_global_row = tile_offset + b_local_row
-            b_global_col = cuda.blockIdx.x * BN5 + b_local_col
-
+            
             # Check if B is in bounds, if it is, put it in shared memory
-            if b_global_row < K and b_global_col < N:
-                B_shared[b_local_row, b_local_col] = B[b_global_row, b_global_col]
+            if b_global_row < K and b_global_col_load < N:
+                B_shared[b_local_row, b_local_col] = B[b_global_row, b_global_col_load]
             else:
                 B_shared[b_local_row, b_local_col] = float32(0.0)
-
+                
         # Wait to make sure every thread has finished writing to shared memory before we start reading
         cuda.syncthreads()
 
@@ -370,18 +389,19 @@ def sgemm_2d_tile(A, B, C, M, N, K):
 
             # Load this threads 8 A values
             for i in range(TM5):
-                a_row = thread_row_group * TM5 + i
-                reg_a[i] = A_shared[a_row, k_offset]
+                # a_row = thread_row_group * TM5 + i
+                reg_a[i] = A_shared[a_row_start + i, k_offset]
 
             # Load this threads 8 B values
             for j in range(TN5):
-                b_col = thread_col_group * TN5 + j
-                reg_b[j] = B_shared[k_offset, b_col]
+                # b_col = thread_col_group * TN5 + j
+                reg_b[j] = B_shared[k_offset, b_col_start + j]
 
             # Actual matrix multiplication using outer product update
             for i in range(TM5):
+                a_i = reg_a[i]
                 for j in range(TN5):
-                    dot_sums[i, j] += reg_a[i] * reg_b[j]                    
+                    dot_sums[i, j] += a_i  * reg_b[j]
 
         cuda.syncthreads()
 
